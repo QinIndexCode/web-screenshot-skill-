@@ -1,7 +1,7 @@
 """
 Web Screenshot Skill for Multimodal LLM
 Captures high-quality web page screenshots at various device resolutions.
-Supports URL, local HTML, batch processing, and metadata generation.
+Supports URL, local HTML, batch processing, metadata generation, and interactive actions.
 """
 
 import argparse
@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
 try:
@@ -131,6 +131,128 @@ class DevicePresets:
         return result
 
 
+class ActionType(Enum):
+    CLICK = "click"
+    FILL = "fill"
+    SCROLL = "scroll"
+    WAIT = "wait"
+    HOVER = "hover"
+    PRESS = "press"
+    SELECT = "select"
+    CHECK = "check"
+    UNCHECK = "uncheck"
+    SCREENSHOT = "screenshot"
+    EVALUATE = "evaluate"
+    WAIT_FOR_SELECTOR = "wait_for_selector"
+    WAIT_FOR_NAVIGATION = "wait_for_navigation"
+    GOTO = "goto"
+
+
+@dataclass
+class Action:
+    type: ActionType
+    selector: Optional[str] = None
+    value: Optional[Any] = None
+    options: Optional[Dict[str, Any]] = None
+    name: Optional[str] = None
+
+    def __repr__(self):
+        parts = [self.type.value]
+        if self.selector:
+            parts.append(f"selector={self.selector[:50]}...")
+        if self.value is not None:
+            val_str = str(self.value)[:30]
+            parts.append(f"value={val_str}")
+        if self.name:
+            parts.append(f"name={self.name}")
+        return f"Action({' '.join(parts)})"
+
+
+def parse_action_string(action_str: str) -> List[Action]:
+    actions = []
+    tokens = action_str.split(";")
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        parts = token.split(":", 1)
+        action_type_str = parts[0].strip().lower()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        try:
+            action_type = ActionType(action_type_str)
+        except ValueError:
+            print(f"WARNING: Unknown action type '{action_type_str}', skipping")
+            continue
+
+        action = Action(type=action_type)
+
+        if action_type == ActionType.SCREENSHOT:
+            if rest:
+                action.name = rest
+        elif action_type == ActionType.WAIT:
+            try:
+                action.value = int(rest) if rest else 1000
+            except ValueError:
+                action.value = 1000
+        elif action_type == ActionType.SCROLL:
+            if rest:
+                coords = rest.split(",")
+                action.value = {
+                    "x": int(coords[0].strip()) if len(coords) > 0 else 0,
+                    "y": int(coords[1].strip()) if len(coords) > 1 else 0,
+                }
+            else:
+                action.value = {"x": 0, "y": 0}
+        elif action_type in (ActionType.CLICK, ActionType.HOVER, ActionType.WAIT_FOR_SELECTOR):
+            action.selector = rest
+        elif action_type == ActionType.FILL:
+            if ":" in rest:
+                sel, val = rest.split(":", 1)
+                action.selector = sel.strip()
+                action.value = val.strip()
+            else:
+                action.selector = rest
+        elif action_type == ActionType.PRESS:
+            if ":" in rest:
+                sel, key = rest.split(":", 1)
+                action.selector = sel.strip()
+                action.value = key.strip()
+            else:
+                action.value = rest.strip()
+        elif action_type == ActionType.SELECT:
+            if ":" in rest:
+                sel, val = rest.split(":", 1)
+                action.selector = sel.strip()
+                action.value = val.strip()
+        elif action_type == ActionType.EVALUATE:
+            action.value = rest
+        elif action_type == ActionType.GOTO:
+            action.value = rest
+
+        actions.append(action)
+
+    return actions
+
+
+@dataclass
+class ActionResult:
+    action: Action
+    success: bool
+    error: Optional[str] = None
+    screenshot_path: Optional[str] = None
+    duration_ms: int = 0
+
+
+@dataclass
+class StepResult:
+    step_name: str
+    file_path: Optional[str]
+    metadata: Optional[Dict]
+    status: str
+    error: Optional[str] = None
+
+
 @dataclass
 class CaptureResult:
     source: str
@@ -146,6 +268,8 @@ class CaptureResult:
     page_title: str = ""
     timestamp: str = ""
     duration_ms: int = 0
+    steps: List[StepResult] = field(default_factory=list)
+    actions: List[ActionResult] = field(default_factory=list)
 
 
 def sanitize_source_name(source: str) -> str:
@@ -160,10 +284,11 @@ def sanitize_source_name(source: str) -> str:
         return Path(source).stem.replace(" ", "_")[:80]
 
 
-def generate_filename(source: str, device: DevicePreset, timestamp: str, fmt: str) -> str:
+def generate_filename(source: str, device: DevicePreset, timestamp: str, fmt: str, step_suffix: str = "") -> str:
     source_name = sanitize_source_name(source)
     ts = timestamp.replace(":", "").replace("-", "").replace("T", "_").replace(".", "_")[:17]
-    return f"{source_name}_{device.name}_{device.width}x{device.height}_{ts}.{fmt}"
+    suffix = f"_{step_suffix}" if step_suffix else ""
+    return f"{source_name}_{device.name}_{device.width}x{device.height}_{ts}{suffix}.{fmt}"
 
 
 @dataclass
@@ -176,6 +301,141 @@ class CaptureOptions:
     dark_mode: bool = False
     metadata: bool = True
     headless: bool = True
+    actions: Optional[List[Action]] = None
+
+
+class ActionEngine:
+    def __init__(self, page: Page, output_dir: Path, device: DevicePreset, options: CaptureOptions):
+        self.page = page
+        self.output_dir = output_dir
+        self.device = device
+        self.options = options
+        self.action_results: List[ActionResult] = []
+        self.step_count = 0
+        self.step_suffix_map: Dict[str, int] = {}
+
+    def _get_step_suffix(self, name: Optional[str]) -> str:
+        if not name:
+            self.step_count += 1
+            return f"step{self.step_count}"
+        if name not in self.step_suffix_map:
+            self.step_suffix_map[name] = 0
+        self.step_suffix_map[name] += 1
+        count = self.step_suffix_map[name]
+        safe_name = re.sub(r'[^a-zA-Z0-9]', '_', name)[:20]
+        return f"{safe_name}_{count}" if count > 1 else safe_name
+
+    async def execute_action(self, action: Action) -> ActionResult:
+        t0 = time.time()
+        result = ActionResult(action=action, success=False, duration_ms=0)
+
+        try:
+            if action.type == ActionType.CLICK:
+                selector = action.selector
+                opts = action.options or {}
+                opts.setdefault("timeout", self.options.timeout_ms)
+                if action.options and "force" in action.options:
+                    opts["force"] = action.options["force"]
+                await self.page.click(selector, **opts)
+                result.success = True
+
+            elif action.type == ActionType.FILL:
+                selector = action.selector
+                value = str(action.value) if action.value is not None else ""
+                await self.page.fill(selector, value)
+                result.success = True
+
+            elif action.type == ActionType.SCROLL:
+                x = action.value.get("x", 0) if action.value else 0
+                y = action.value.get("y", 0) if action.value else 0
+                await self.page.evaluate(f"window.scrollTo({x}, {y})")
+                result.success = True
+
+            elif action.type == ActionType.WAIT:
+                ms = action.value if action.value else self.options.wait_ms
+                await self.page.wait_for_timeout(ms)
+                result.success = True
+
+            elif action.type == ActionType.HOVER:
+                selector = action.selector
+                await self.page.hover(selector)
+                result.success = True
+
+            elif action.type == ActionType.PRESS:
+                selector = action.selector
+                key = action.value
+                if selector:
+                    await self.page.press(selector, key)
+                else:
+                    await self.page.keyboard.press(key)
+                result.success = True
+
+            elif action.type == ActionType.SELECT:
+                selector = action.selector
+                value = action.value
+                await self.page.select_option(selector, value)
+                result.success = True
+
+            elif action.type == ActionType.WAIT_FOR_SELECTOR:
+                selector = action.selector
+                opts = action.options or {}
+                opts.setdefault("timeout", self.options.timeout_ms)
+                await self.page.wait_for_selector(selector, **opts)
+                result.success = True
+
+            elif action.type == ActionType.WAIT_FOR_NAVIGATION:
+                opts = action.options or {}
+                opts.setdefault("timeout", self.options.timeout_ms)
+                await self.page.wait_for_load_state("networkidle", timeout=opts["timeout"])
+                result.success = True
+
+            elif action.type == ActionType.EVALUATE:
+                js_code = action.value
+                await self.page.evaluate(js_code)
+                result.success = True
+
+            elif action.type == ActionType.GOTO:
+                url = action.value
+                await self.page.goto(url, wait_until="networkidle", timeout=self.options.timeout_ms)
+                result.success = True
+
+            elif action.type == ActionType.SCREENSHOT:
+                timestamp = datetime.now().isoformat()
+                suffix = self._get_step_suffix(action.name)
+                filename = generate_filename(
+                    getattr(self, '_source', 'interactive'),
+                    self.device,
+                    timestamp,
+                    self.options.format,
+                    suffix
+                )
+                filepath = self.output_dir / filename
+
+                screenshot_args = {"path": str(filepath), "full_page": False}
+                if self.options.format == "jpeg":
+                    screenshot_args["quality"] = self.options.quality
+
+                await self.page.screenshot(**screenshot_args)
+                result.success = filepath.exists()
+                result.screenshot_path = str(filepath)
+
+        except Exception as e:
+            result.success = False
+            result.error = str(e)
+
+        result.duration_ms = int((time.time() - t0) * 1000)
+        return result
+
+    async def execute_all(self, actions: List[Action], source: str) -> List[ActionResult]:
+        self._source = source
+        results = []
+        for action in actions:
+            result = await self.execute_action(action)
+            results.append(result)
+            self.action_results.append(result)
+            if not result.success:
+                print(f"  WARNING: Action {action.type.value} failed: {result.error}")
+        return results
 
 
 class WebScreenshot:
@@ -236,6 +496,15 @@ class WebScreenshot:
 
             result.page_title = await page.title()
 
+            engine = ActionEngine(page, self.output_dir, device, options)
+
+            if options.actions:
+                action_results = await engine.execute_all(options.actions, source)
+                result.actions = [
+                    {"type": ar.action.type.value, "success": ar.success, "error": ar.error, "duration_ms": ar.duration_ms}
+                    for ar in action_results
+                ]
+
             filename = generate_filename(source, device, timestamp, options.format)
             filepath = self.output_dir / filename
 
@@ -268,6 +537,7 @@ class WebScreenshot:
                     "format": options.format,
                     "file_size_kb": result.file_size_kb,
                     "page_title": result.page_title,
+                    "actions_executed": len(options.actions) if options.actions else 0,
                 }
                 meta_filename = filename.rsplit(".", 1)[0] + ".json"
                 meta_filepath = self.output_dir / meta_filename
@@ -336,11 +606,17 @@ class WebScreenshot:
         device: Optional[DevicePreset] = None,
         devices: Optional[List[DevicePreset]] = None,
         options: Optional[CaptureOptions] = None,
+        actions: Optional[List[Action]] = None,
     ) -> Union[CaptureResult, List[CaptureResult]]:
         if device and not devices:
             devices = [device]
         elif not devices:
             devices = [DevicePresets.IPHONE_14_PRO]
+
+        if options is None:
+            options = CaptureOptions()
+        if actions is not None:
+            options.actions = actions
 
         results = asyncio.run(self.capture_async(url=url, file=file, devices=devices, options=options))
 
@@ -418,17 +694,25 @@ def print_results(results: List[CaptureResult]):
     print(f"  SCREENSHOT RESULTS")
     print(f"{'='*70}")
     print(f"  Total: {len(results)} | Success: {len(success)} | Failed: {len(failed)}")
-    print(f"  Output: {Path(results[0].file_path).parent if success else 'N/A'}")
+    if success:
+        print(f"  Output: {Path(results[0].file_path).parent if success else 'N/A'}")
     print()
 
     for r in results:
         icon = "OK" if r.status == "success" else "FAIL"
         size_str = f"{r.file_size_kb}KB" if r.file_size_kb else "N/A"
-        print(f"  [{icon}] {r.device} ({r.width}x{r.height}) -> {size_str} | {r.duration_ms}ms")
+        action_info = f" | {len(r.actions)} actions" if r.actions else ""
+        print(f"  [{icon}] {r.device} ({r.width}x{r.height}) -> {size_str} | {r.duration_ms}ms{action_info}")
         if r.file_path:
             print(f"       {r.file_path}")
         if r.error:
             print(f"       Error: {r.error[:120]}")
+        if r.actions:
+            for i, act in enumerate(r.actions):
+                act_icon = "OK" if act.get("success") else "FAIL"
+                print(f"       [{act_icon}] {i+1}. {act.get('type')}: {act.get('duration_ms', 0)}ms")
+                if not act.get("success") and act.get("error"):
+                    print(f"            Error: {act.get('error')[:80]}")
 
     print(f"{'='*70}")
 
@@ -440,7 +724,7 @@ def print_results(results: List[CaptureResult]):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Web Screenshot Skill - Capture web page screenshots at multiple device resolutions",
+        description="Web Screenshot Skill - Capture web page screenshots at multiple device resolutions with interactive actions",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Device Presets:
@@ -448,7 +732,24 @@ Device Presets:
   Desktop: hd, full_hd, 2k, 4k
   Groups:  all_mobile, all_desktop, all
 
-Examples:
+Action Syntax (--actions):
+  click:<selector>              Click element (CSS selector or text)
+  fill:<selector>:<value>        Fill input field
+  scroll:<x>,<y>                Scroll to coordinates
+  wait:<ms>                     Wait milliseconds (default: 1000)
+  hover:<selector>              Hover over element
+  press:<selector>:<key>        Press keyboard key on element
+  screenshot[:<name>]           Take screenshot with optional name
+  wait_for_selector:<selector>  Wait for element to appear
+  evaluate:<js>                 Execute JavaScript
+  goto:<url>                     Navigate to URL
+
+Action Examples:
+  python web_screenshot.py --url "https://example.com" --actions "click:#menu;wait:500;screenshot:menu_open"
+  python web_screenshot.py --url "https://example.com" --actions "fill:#username:test;fill:#password:123;screenshot"
+  python web_screenshot.py --file "./index.html" --actions "scroll:0,500;wait:300;screenshot:scrolled"
+
+CLI Examples:
   python web_screenshot.py --url "https://example.com"
   python web_screenshot.py --file "./index.html" --devices "iphone_se,full_hd"
   python web_screenshot.py --url "https://example.com" --devices "all_mobile" --full-page
@@ -474,6 +775,7 @@ Examples:
     parser.add_argument("--dark-mode", action="store_true", help="Enable dark mode")
     parser.add_argument("--no-metadata", action="store_true", help="Skip metadata JSON sidecar")
     parser.add_argument("--no-headless", action="store_true", help="Run browser visibly (debug)")
+    parser.add_argument("--actions", help="Interactive actions (semicolon-separated)")
 
     args = parser.parse_args()
 
@@ -494,6 +796,14 @@ Examples:
         print("ERROR: No valid device presets specified")
         sys.exit(2)
 
+    parsed_actions = None
+    if args.actions:
+        parsed_actions = parse_action_string(args.actions)
+        if not parsed_actions:
+            print("ERROR: No valid actions specified")
+            sys.exit(2)
+        print(f"Actions: {len(parsed_actions)} action(s) configured")
+
     options = CaptureOptions(
         full_page=args.full_page,
         quality=args.quality,
@@ -503,6 +813,7 @@ Examples:
         dark_mode=args.dark_mode,
         metadata=not args.no_metadata,
         headless=not args.no_headless,
+        actions=parsed_actions,
     )
 
     capturer = WebScreenshot(output_dir=args.output)
@@ -517,12 +828,12 @@ Examples:
             results = capturer.capture_batch(urls=urls, devices=devices, options=options)
         elif args.url:
             print(f"Capturing: {args.url} @ {len(devices)} device(s)")
-            results = capturer.capture(url=args.url, devices=devices, options=options)
+            results = capturer.capture(url=args.url, devices=devices, options=options, actions=parsed_actions)
             if isinstance(results, CaptureResult):
                 results = [results]
         elif args.file:
             print(f"Capturing: {args.file} @ {len(devices)} device(s)")
-            results = capturer.capture(file=args.file, devices=devices, options=options)
+            results = capturer.capture(file=args.file, devices=devices, options=options, actions=parsed_actions)
             if isinstance(results, CaptureResult):
                 results = [results]
         else:
